@@ -1,5 +1,10 @@
 package lb
 
+import (
+	"log"
+	"net/http"
+)
+
 // ServerPool holds the set of upstreams the load balancer can route
 // requests to, plus the Algorithm used to pick between them.
 type ServerPool struct {
@@ -8,9 +13,17 @@ type ServerPool struct {
 }
 
 // NewServerPool builds a pool from a list of upstreams and the algorithm
-// to use when selecting between them.
+// to use when selecting between them. Each upstream's reverse proxy is
+// wired to fail over to another healthy upstream if a request to it fails,
+// rather than waiting for the next scheduled health check to notice.
 func NewServerPool(upstreams []*Upstream, algorithm Algorithm) *ServerPool {
-	return &ServerPool{upstreams: upstreams, algorithm: algorithm}
+	p := &ServerPool{upstreams: upstreams, algorithm: algorithm}
+
+	for _, u := range upstreams {
+		u.ReverseProxy.ErrorHandler = p.handleProxyError(u)
+	}
+
+	return p
 }
 
 // Upstreams returns the full list of upstreams in the pool.
@@ -37,4 +50,24 @@ func (p *ServerPool) aliveUpstreams() []*Upstream {
 		}
 	}
 	return alive
+}
+
+// handleProxyError builds the failure handler for a single upstream's
+// reverse proxy. It only fires when the request to that upstream failed
+// outright (e.g. connection refused) — before any response reached the
+// client — so it's safe to immediately retry the same request against a
+// different healthy upstream instead of failing it.
+func (p *ServerPool) handleProxyError(u *Upstream) func(http.ResponseWriter, *http.Request, error) {
+	return func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("upstream %s failed: %v — marking unhealthy", u.URL, err)
+		u.SetAlive(false)
+
+		next := p.NextUpstream()
+		if next == nil {
+			http.Error(w, "no healthy upstreams available", http.StatusServiceUnavailable)
+			return
+		}
+
+		next.ReverseProxy.ServeHTTP(w, r)
+	}
 }
