@@ -37,12 +37,24 @@ func (s *StickySession) Route(w http.ResponseWriter, r *http.Request) *Upstream 
 		s.mu.RLock()
 		upstream, ok := s.sessions[cookie.Value]
 		s.mu.RUnlock()
-		if ok {
+
+		if ok && upstream.IsAlive() {
 			return upstream
+		}
+
+		if ok {
+			// The upstream we'd previously pinned this client to has died.
+			// Drop the stale mapping and fall through to pick a fresh one.
+			s.mu.Lock()
+			delete(s.sessions, cookie.Value)
+			s.mu.Unlock()
 		}
 	}
 
 	upstream := s.pool.NextUpstream()
+	if upstream == nil {
+		return nil
+	}
 
 	sessionID := generateSessionID()
 	s.mu.Lock()

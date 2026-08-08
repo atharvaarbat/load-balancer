@@ -19,7 +19,22 @@ func (p *ServerPool) Upstreams() []*Upstream {
 }
 
 // NextUpstream returns the next upstream to handle a request, as decided
-// by the pool's algorithm.
+// by the pool's algorithm, considering only currently healthy upstreams.
+// It returns nil if none are healthy.
 func (p *ServerPool) NextUpstream() *Upstream {
-	return p.algorithm.Next(p.upstreams)
+	alive := p.aliveUpstreams()
+	if len(alive) == 0 {
+		return nil
+	}
+	return p.algorithm.Next(alive)
+}
+
+func (p *ServerPool) aliveUpstreams() []*Upstream {
+	alive := make([]*Upstream, 0, len(p.upstreams))
+	for _, u := range p.upstreams {
+		if u.IsAlive() {
+			alive = append(alive, u)
+		}
+	}
+	return alive
 }

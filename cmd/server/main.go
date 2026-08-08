@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/atharvaarbat/load-balancer/internal/lb"
 )
@@ -32,8 +33,15 @@ func main() {
 	pool := lb.NewServerPool(upstreams, &lb.RoundRobin{})
 	sticky := lb.NewStickySession(pool)
 
+	healthChecker := lb.NewHealthChecker(pool, 5*time.Second)
+	healthChecker.Start()
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		upstream := sticky.Route(w, r)
+		if upstream == nil {
+			http.Error(w, "no healthy upstreams available", http.StatusServiceUnavailable)
+			return
+		}
 		upstream.ReverseProxy.ServeHTTP(w, r)
 	})
 
