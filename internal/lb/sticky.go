@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,7 +21,7 @@ const sessionSweepInterval = 5 * time.Minute
 
 type session struct {
 	upstream   *Upstream
-	lastAccess time.Time
+	lastAccess atomic.Int64 // unix nanos; atomic so the read path only needs an RLock
 }
 
 // StickySession wraps a ServerPool and remembers which upstream each
@@ -29,7 +30,7 @@ type session struct {
 type StickySession struct {
 	pool *ServerPool
 
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	sessions map[string]*session
 }
 
@@ -57,13 +58,13 @@ func (s *StickySession) startSweeper() {
 }
 
 func (s *StickySession) sweep() {
-	cutoff := time.Now().Add(-sessionTTL)
+	cutoff := time.Now().Add(-sessionTTL).UnixNano()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for id, sess := range s.sessions {
-		if sess.lastAccess.Before(cutoff) {
+		if sess.lastAccess.Load() < cutoff {
 			delete(s.sessions, id)
 		}
 	}
@@ -76,20 +77,23 @@ func (s *StickySession) sweep() {
 // from this client come back here.
 func (s *StickySession) Route(w http.ResponseWriter, r *http.Request) *Upstream {
 	if cookie, err := r.Cookie(stickyCookieName); err == nil {
-		s.mu.Lock()
+		s.mu.RLock()
 		sess, ok := s.sessions[cookie.Value]
 		if ok && sess.upstream.IsAlive() {
-			sess.lastAccess = time.Now()
+			sess.lastAccess.Store(time.Now().UnixNano())
 			upstream := sess.upstream
-			s.mu.Unlock()
+			s.mu.RUnlock()
 			return upstream
 		}
+		s.mu.RUnlock()
+
 		if ok {
 			// The upstream we'd previously pinned this client to has died.
 			// Drop the stale mapping and fall through to pick a fresh one.
+			s.mu.Lock()
 			delete(s.sessions, cookie.Value)
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
 	}
 
 	upstream := s.pool.NextUpstream()
@@ -98,8 +102,10 @@ func (s *StickySession) Route(w http.ResponseWriter, r *http.Request) *Upstream 
 	}
 
 	sessionID := generateSessionID()
+	sess := &session{upstream: upstream}
+	sess.lastAccess.Store(time.Now().UnixNano())
 	s.mu.Lock()
-	s.sessions[sessionID] = &session{upstream: upstream, lastAccess: time.Now()}
+	s.sessions[sessionID] = sess
 	s.mu.Unlock()
 
 	http.SetCookie(w, &http.Cookie{
