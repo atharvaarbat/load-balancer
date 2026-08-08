@@ -1,6 +1,7 @@
 package lb
 
 import (
+	"context"
 	"log"
 	"net/http"
 )
@@ -52,15 +53,55 @@ func (p *ServerPool) aliveUpstreams() []*Upstream {
 	return alive
 }
 
+// retryCountKey is the context key used to track how many times a request
+// has already been failed over to a different upstream.
+type retryCountKey struct{}
+
+func retryCountFrom(r *http.Request) int {
+	if n, ok := r.Context().Value(retryCountKey{}).(int); ok {
+		return n
+	}
+	return 0
+}
+
+func withIncrementedRetryCount(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), retryCountKey{}, retryCountFrom(r)+1))
+}
+
 // handleProxyError builds the failure handler for a single upstream's
 // reverse proxy. It only fires when the request to that upstream failed
 // outright (e.g. connection refused) — before any response reached the
-// client — so it's safe to immediately retry the same request against a
-// different healthy upstream instead of failing it.
+// client — so it's usually safe to retry the same request against a
+// different healthy upstream instead of failing it. Three guards keep that
+// safe:
+//   - if the request's own context is already done, the client disconnected
+//     or its deadline expired; that's not the upstream's fault, so we
+//     neither penalize it nor retry.
+//   - if the request has a body, it may already have been partially
+//     streamed to the failed upstream, so blindly replaying it elsewhere
+//     could silently send a truncated body. Only bodyless requests are
+//     retried automatically.
+//   - retries are capped at one attempt per remaining upstream, so a
+//     request can't bounce through the whole pool more times than there
+//     are upstreams to try.
 func (p *ServerPool) handleProxyError(u *Upstream) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
+		if r.Context().Err() != nil {
+			return
+		}
+
 		log.Printf("upstream %s failed: %v — marking unhealthy", u.URL, err)
 		u.SetAlive(false)
+
+		if r.ContentLength != 0 {
+			http.Error(w, "upstream request failed", http.StatusBadGateway)
+			return
+		}
+
+		if retryCountFrom(r) >= len(p.upstreams)-1 {
+			http.Error(w, "no healthy upstreams available", http.StatusServiceUnavailable)
+			return
+		}
 
 		next := p.NextUpstream()
 		if next == nil {
@@ -68,6 +109,6 @@ func (p *ServerPool) handleProxyError(u *Upstream) func(http.ResponseWriter, *ht
 			return
 		}
 
-		next.ReverseProxy.ServeHTTP(w, r)
+		next.ReverseProxy.ServeHTTP(w, withIncrementedRetryCount(r))
 	}
 }

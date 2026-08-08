@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go version *)",
+      "Bash(python test/lb_test.py)"
+    ]
+  }
+}
