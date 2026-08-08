@@ -30,7 +30,7 @@ func main() {
 		upstreams = append(upstreams, u)
 	}
 
-	pool := lb.NewServerPool(upstreams, &lb.RoundRobin{})
+	pool := lb.NewServerPool(upstreams, &lb.P2C{})
 	sticky := lb.NewStickySession(pool)
 
 	healthChecker := lb.NewHealthChecker(pool, 5*time.Second)
@@ -42,7 +42,7 @@ func main() {
 			http.Error(w, "no healthy upstreams available", http.StatusServiceUnavailable)
 			return
 		}
-		upstream.ReverseProxy.ServeHTTP(w, r)
+		pool.Serve(w, r, upstream)
 	})
 
 	log.Println("Load Balancer running on :8080")

@@ -22,7 +22,7 @@ import (
 // surface.
 func TestPool_ConcurrentSelectionAndAliveFlips(t *testing.T) {
 	upstreams := dummyUpstreams(t, 8)
-	pool := NewServerPool(upstreams, &RoundRobin{})
+	pool := NewServerPool(upstreams, &P2C{})
 
 	const readers = 50
 	const flippers = 20

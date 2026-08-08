@@ -90,7 +90,7 @@ func upstreamFor(t *testing.T, f *fakeUpstream) *Upstream {
 
 // dummyUpstreams builds n *Upstream values with distinct placeholder URLs
 // and no backing server — for tests that only exercise selection logic
-// (RoundRobin, pool filtering, concurrent SetAlive/NextUpstream) and never
+// (P2C, pool filtering, concurrent SetAlive/NextUpstream) and never
 // actually issue a request.
 func dummyUpstreams(t *testing.T, n int) []*Upstream {
 	t.Helper()
@@ -107,7 +107,7 @@ func dummyUpstreams(t *testing.T, n int) []*Upstream {
 }
 
 // newFakePool builds a ServerPool of n fake upstreams behind the real
-// RoundRobin algorithm. The returned fakes slice is index-aligned with
+// P2C algorithm. The returned fakes slice is index-aligned with
 // pool.Upstreams().
 func newFakePool(t *testing.T, n int) (*ServerPool, []*fakeUpstream) {
 	t.Helper()
@@ -119,7 +119,7 @@ func newFakePool(t *testing.T, n int) (*ServerPool, []*fakeUpstream) {
 		upstreams[i] = upstreamFor(t, fakes[i])
 	}
 
-	return NewServerPool(upstreams, &RoundRobin{}), fakes
+	return NewServerPool(upstreams, &P2C{}), fakes
 }
 
 // fullStack wires ServerPool + StickySession + HealthChecker together
@@ -158,7 +158,7 @@ func newFullStack(t *testing.T, n int, healthInterval time.Duration) *fullStack 
 			http.Error(w, "no healthy upstreams available", http.StatusServiceUnavailable)
 			return
 		}
-		upstream.ReverseProxy.ServeHTTP(w, r)
+		pool.Serve(w, r, upstream)
 	})
 
 	srv := httptest.NewServer(mux)

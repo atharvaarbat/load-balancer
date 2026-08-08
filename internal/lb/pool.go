@@ -53,6 +53,19 @@ func (p *ServerPool) aliveUpstreams() []*Upstream {
 	return alive
 }
 
+// Serve dispatches a request to the given upstream, counting it as in-flight
+// for the duration so load-aware algorithms (e.g. P2C) see real-time load.
+// The count is incremented before the request is proxied and decremented via
+// defer once it completes, so every exit path — a clean response, an error,
+// or an internal failover to another upstream — is accounted for exactly
+// once. All request dispatch should go through here rather than calling
+// upstream.ReverseProxy.ServeHTTP directly, or the in-flight count will drift.
+func (p *ServerPool) Serve(w http.ResponseWriter, r *http.Request, u *Upstream) {
+	u.IncInflight()
+	defer u.DecInflight()
+	u.ReverseProxy.ServeHTTP(w, r)
+}
+
 // retryCountKey is the context key used to track how many times a request
 // has already been failed over to a different upstream.
 type retryCountKey struct{}
@@ -109,6 +122,6 @@ func (p *ServerPool) handleProxyError(u *Upstream) func(http.ResponseWriter, *ht
 			return
 		}
 
-		next.ReverseProxy.ServeHTTP(w, withIncrementedRetryCount(r))
+		p.Serve(w, withIncrementedRetryCount(r), next)
 	}
 }
