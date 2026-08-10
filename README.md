@@ -1,4 +1,4 @@
-# load-balancer
+# Load Balancer
 
 This project is a small HTTP load balancer. It is written in Go. It is a learning project, built from scratch.
 

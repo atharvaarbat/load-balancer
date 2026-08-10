@@ -44,8 +44,6 @@
 
 ---
 
----
-
 ## Phase 3 — Production hardening
 
 **Why.** A review against real production deployment turned up several gaps: an unauthenticated memory-exhaustion path, a flapping bug in the health/failover interaction, missing HTTP server timeouts, connection-pool starvation, spoofable forwarding headers, and no operational visibility at all. None of these show up in a demo — they show up under real traffic, real attackers, or a real deploy.
