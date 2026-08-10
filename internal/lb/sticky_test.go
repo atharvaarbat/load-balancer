@@ -10,6 +10,7 @@ import (
 func TestStickySession_PinsToSameUpstream(t *testing.T) {
 	pool, _ := newFakePool(t, 3)
 	sticky := NewStickySession(pool)
+	t.Cleanup(sticky.Stop)
 
 	w1 := httptest.NewRecorder()
 	r1 := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -36,6 +37,7 @@ func TestStickySession_PinsToSameUpstream(t *testing.T) {
 func TestStickySession_DeadUpstreamFallsThrough(t *testing.T) {
 	pool, _ := newFakePool(t, 3)
 	sticky := NewStickySession(pool)
+	t.Cleanup(sticky.Stop)
 
 	w1 := httptest.NewRecorder()
 	r1 := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -67,6 +69,7 @@ func TestStickySession_DeadUpstreamFallsThrough(t *testing.T) {
 func TestStickySession_UnknownCookieGetsFreshSession(t *testing.T) {
 	pool, _ := newFakePool(t, 3)
 	sticky := NewStickySession(pool)
+	t.Cleanup(sticky.Stop)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -86,6 +89,7 @@ func TestStickySession_UnknownCookieGetsFreshSession(t *testing.T) {
 func TestStickySession_SweepEvictsExpiredSessions(t *testing.T) {
 	pool, _ := newFakePool(t, 2)
 	sticky := NewStickySession(pool)
+	t.Cleanup(sticky.Stop)
 	upstreams := pool.Upstreams()
 
 	stale := &session{upstream: upstreams[0]}

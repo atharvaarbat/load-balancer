@@ -27,18 +27,18 @@ The load balancer changes an upstream server's status only after 2 consecutive s
 
 ### Sticky sessions
 
-The load balancer sets an `LB_SESSION_ID` cookie on a client's first request. This cookie pins the client to the upstream server that handled that request. Later requests from the same client go to the same upstream server.
+The load balancer sets an `LB_SESSION_ID` cookie on a client's first request. This cookie pins the client to the upstream server that handled that request. Later requests from the same client go to the same upstream server. The cookie is `HttpOnly`, `Secure`, and `SameSite=Lax`, with a `Max-Age` matching the session TTL below.
 
-If a session is idle for 30 minutes or more, the load balancer removes it during a periodic sweep. This sweep stops the session map from growing without limit.
+If a session is idle for 30 minutes or more, the load balancer removes it during a periodic sweep. This sweep stops the session map from growing without limit. The session table also has a hard cap (100,000 entries); once full, new clients are still routed but without a pinned session, so a flood of cookie-less requests can't grow the map without bound.
 
 If the pinned upstream server fails, the load balancer picks a new upstream server for the client.
 
 ### Automatic failover
 
-A request to an upstream server can fail outright, for example when the connection is refused. When this happens, the load balancer does two things:
+A request to an upstream server can fail outright (connection refused) or come back with a 5xx status. When this happens, the load balancer:
 
-1. It marks the upstream server as unhealthy.
-2. It retries the request on a different, healthy upstream server.
+1. Counts it as a consecutive failure for that upstream server. Only after 2 consecutive failures does it mark the server unhealthy — a single blip doesn't eject an otherwise-healthy server from the pool, matching the hysteresis the active health checker applies. Any successful response resets the count.
+2. For a failed-outright request, retries it on a different, healthy upstream server not already tried by this request.
 
 The load balancer retries a request at most once per remaining upstream server.
 
@@ -51,14 +51,22 @@ These rules stop the load balancer from resending a partial body. They also stop
 
 For the design rationale and history behind these decisions, see [JOURNEY.md](./JOURNEY.md).
 
+### Observability
+
+`GET /health` reflects real pool state: it returns 200 only while at least one upstream server is alive, so a readiness probe or DNS failover check can actually detect a fully-down load balancer.
+
+`GET /metrics` exposes per-upstream alive status, in-flight count, and cumulative request/failure counters, plus the current sticky-session count, in Prometheus text-exposition format.
+
+Every request is logged as one structured JSON line (method, path, status, duration, remote address) with a request ID that's generated if absent and propagated to the backend and back to the client via `X-Request-ID`.
+
 ## Project layout
 
 ```
 cmd/
-  server/    entry point for the load balancer (port 8080)
+  server/    entry point for the load balancer (port 8080), plus its Dockerfile
   backend/   test backend used by the integration test harness
 internal/lb/
-  upstream.go    Upstream type: URL, reverse proxy, alive flag, in-flight counter
+  upstream.go    Upstream type: URL, reverse proxy, alive flag, in-flight/failure counters
   algorithm.go   Algorithm interface and the P2C implementation
   pool.go        ServerPool type: filters alive upstream servers, dispatches requests, handles failover
   health.go      HealthChecker type: polls /health on an interval, applies the consecutive-check rule
@@ -70,12 +78,21 @@ test/
 ## Requirements
 
 - Go, version 1.25.6 or later
-- Docker (needed only for the integration test harness in `test/`)
+- Docker (needed only for the integration test harness in `test/`, or to build the images in `cmd/server/Dockerfile` / `cmd/backend/Dockerfile`)
 - Python 3 (needed only to run `test/lb_test.py`)
 
-## How to run the load balancer
+## Configuration
 
-The upstream server list is hardcoded in `cmd/server/main.go`.
+The load balancer is configured entirely through environment variables, so it can be redeployed with a different pool or listen address without a rebuild:
+
+| Variable              | Default                                                             | Purpose                                    |
+| --------------------- | -------------------------------------------------------------------- | ------------------------------------------- |
+| `LB_ADDR`              | `:8080`                                                              | Listen address                              |
+| `LB_UPSTREAMS`         | `http://localhost:9001,http://localhost:9002,http://localhost:9003` | Comma-separated upstream URLs               |
+| `LB_HEALTH_INTERVAL`   | `5s`                                                                 | Active health-check polling interval        |
+| `LB_SHUTDOWN_TIMEOUT`  | `15s`                                                                | How long graceful shutdown waits to drain   |
+
+## How to run the load balancer
 
 Step 1: Start three backend instances, on ports 9001, 9002, and 9003.
 
@@ -91,7 +108,7 @@ Step 2: Start the load balancer.
 go run ./cmd/server
 ```
 
-The load balancer listens on port 8080. It proxies requests on `/` to an upstream server. It returns a static response `ok` on `/health`.
+The load balancer listens on port 8080 (or `LB_ADDR`). It proxies requests on `/` to an upstream server, reports pool health on `/health`, and exposes Prometheus-format metrics on `/metrics`. It shuts down gracefully on SIGINT/SIGTERM, draining in-flight requests before exiting.
 
 ## How to test the load balancer
 
@@ -130,4 +147,4 @@ Note: Before you run this test, stop any load balancer started with `go run ./cm
 6. `ServerPool.Serve` increments the in-flight counter of the chosen upstream server.
 7. `ServerPool.Serve` proxies the request to the chosen upstream server.
 8. `ServerPool.Serve` decrements the in-flight counter when the request is done. This step uses `defer`, so the counter is decremented on every exit path.
-9. If the proxied request fails outright, the load balancer marks the upstream server as unhealthy and retries the request on a different, healthy upstream server. The retry rules in the Automatic Failover section apply.
+9. If the proxied request fails outright or returns a 5xx, the load balancer counts it toward that upstream server's consecutive-failure streak (marking it unhealthy once the streak crosses the threshold) and, for a request that failed outright, retries it on a different, healthy upstream server. The retry rules in the Automatic Failover section apply.

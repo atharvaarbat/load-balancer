@@ -1,0 +1,12 @@
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+bin/
+
+# Test/log output
+*.log
+
+# Editor/OS cruft
+.DS_Store

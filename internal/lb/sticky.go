@@ -19,6 +19,14 @@ const sessionTTL = 30 * time.Minute
 // sessionSweepInterval controls how often expired sessions are purged.
 const sessionSweepInterval = 5 * time.Minute
 
+// maxSessions caps how many sticky-session mappings are kept at once. Every
+// request without a valid session cookie (any cookie-less client — curl,
+// SDKs, health probes, or an attacker looping requests) would otherwise
+// allocate a permanent entry, growing the map without bound between sweeps.
+// Once the cap is hit, new clients still get routed but fall back to
+// stateless selection (no cookie is issued) until sweep() frees up room.
+const maxSessions = 100_000
+
 type session struct {
 	upstream   *Upstream
 	lastAccess atomic.Int64 // unix nanos; atomic so the read path only needs an RLock
@@ -32,6 +40,9 @@ type StickySession struct {
 
 	mu       sync.RWMutex
 	sessions map[string]*session
+
+	stop chan struct{}
+	done chan struct{}
 }
 
 // NewStickySession wraps a pool with sticky-session routing.
@@ -39,6 +50,8 @@ func NewStickySession(pool *ServerPool) *StickySession {
 	s := &StickySession{
 		pool:     pool,
 		sessions: make(map[string]*session),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 	s.startSweeper()
 	return s
@@ -48,26 +61,56 @@ func NewStickySession(pool *ServerPool) *StickySession {
 // sessionTTL, so the map doesn't grow forever as clients churn.
 func (s *StickySession) startSweeper() {
 	go func() {
+		defer close(s.done)
+
 		ticker := time.NewTicker(sessionSweepInterval)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			s.sweep()
+		for {
+			select {
+			case <-s.stop:
+				return
+			case <-ticker.C:
+				s.sweep()
+			}
 		}
 	}()
 }
 
+// Stop halts the background sweeper goroutine and waits for it to exit, so
+// callers can shut it down cleanly instead of leaking it for the life of
+// the process.
+func (s *StickySession) Stop() {
+	close(s.stop)
+	<-s.done
+}
+
+// sweep evicts expired sessions in two phases so it never holds the
+// exclusive lock for the full map scan: expired keys are collected under a
+// read lock (letting Route() keep serving concurrently), then deleted under
+// a briefly-held write lock. Without this, a sweep over a large map would
+// block every in-flight request for its entire duration.
 func (s *StickySession) sweep() {
 	cutoff := time.Now().Add(-sessionTTL).UnixNano()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	s.mu.RLock()
+	var expired []string
 	for id, sess := range s.sessions {
 		if sess.lastAccess.Load() < cutoff {
-			delete(s.sessions, id)
+			expired = append(expired, id)
 		}
 	}
+	s.mu.RUnlock()
+
+	if len(expired) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	for _, id := range expired {
+		delete(s.sessions, id)
+	}
+	s.mu.Unlock()
 }
 
 // Route returns the upstream that should handle this request. If the
@@ -101,21 +144,40 @@ func (s *StickySession) Route(w http.ResponseWriter, r *http.Request) *Upstream 
 		return nil
 	}
 
-	sessionID := generateSessionID()
-	sess := &session{upstream: upstream}
-	sess.lastAccess.Store(time.Now().UnixNano())
 	s.mu.Lock()
-	s.sessions[sessionID] = sess
+	full := len(s.sessions) >= maxSessions
+	if !full {
+		sessionID := generateSessionID()
+		sess := &session{upstream: upstream}
+		sess.lastAccess.Store(time.Now().UnixNano())
+		s.sessions[sessionID] = sess
+		s.mu.Unlock()
+
+		http.SetCookie(w, &http.Cookie{
+			Name:     stickyCookieName,
+			Value:    sessionID,
+			Path:     "/",
+			MaxAge:   int(sessionTTL.Seconds()),
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteLaxMode,
+		})
+		return upstream
+	}
 	s.mu.Unlock()
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     stickyCookieName,
-		Value:    sessionID,
-		Path:     "/",
-		HttpOnly: true,
-	})
-
+	// Session table is at capacity. Route this request without pinning it,
+	// rather than letting the map grow without bound; it'll get a real
+	// sticky session once sweep() frees up room.
 	return upstream
+}
+
+// SessionCount reports how many sticky-session mappings are currently
+// tracked. Exposed for observability (see /metrics in cmd/server).
+func (s *StickySession) SessionCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.sessions)
 }
 
 func generateSessionID() string {

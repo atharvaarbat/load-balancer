@@ -25,6 +25,9 @@ type HealthChecker struct {
 
 	mu     sync.Mutex
 	streak map[*Upstream]int // positive = consecutive successes, negative = consecutive failures
+
+	stop chan struct{}
+	done chan struct{}
 }
 
 // NewHealthChecker builds a checker that polls every interval.
@@ -34,22 +37,37 @@ func NewHealthChecker(pool *ServerPool, interval time.Duration) *HealthChecker {
 		interval: interval,
 		client:   &http.Client{Timeout: 2 * time.Second},
 		streak:   make(map[*Upstream]int),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 }
 
 // Start runs the health check loop in a background goroutine: an immediate
-// check first, then again every interval, for as long as the process runs.
+// check first, then again every interval, until Stop is called.
 func (h *HealthChecker) Start() {
 	go func() {
+		defer close(h.done)
+
 		h.checkAll()
 
 		ticker := time.NewTicker(h.interval)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			h.checkAll()
+		for {
+			select {
+			case <-h.stop:
+				return
+			case <-ticker.C:
+				h.checkAll()
+			}
 		}
 	}()
+}
+
+// Stop halts the background probe loop and waits for it to exit.
+func (h *HealthChecker) Stop() {
+	close(h.stop)
+	<-h.done
 }
 
 func (h *HealthChecker) checkAll() {
@@ -72,6 +90,22 @@ func (h *HealthChecker) checkAll() {
 func (h *HealthChecker) record(upstream *Upstream, ok bool) {
 	h.mu.Lock()
 	streak := h.streak[upstream]
+
+	// The alive flag can also be flipped out-of-band by the failover path
+	// (pool.go) ejecting an upstream after repeated request failures. If
+	// that happened, our streak no longer reflects reality — e.g. alive was
+	// forced false while streak was still a large positive number from a
+	// long healthy run. Left alone, the very next successful probe would
+	// cross the healthy threshold and re-admit the upstream instantly,
+	// bypassing the hysteresis this checker exists to provide. Detect the
+	// mismatch (a streak value that could never have produced the current
+	// alive state on its own) and reset it so re-admission still requires a
+	// full healthy streak.
+	alive := upstream.IsAlive()
+	if (!alive && streak > healthyThreshold-1) || (alive && streak < -(unhealthyThreshold-1)) {
+		streak = 0
+	}
+
 	if ok {
 		if streak < 0 {
 			streak = 0

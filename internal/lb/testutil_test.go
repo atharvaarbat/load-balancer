@@ -133,20 +133,20 @@ type fullStack struct {
 	Fakes   []*fakeUpstream
 }
 
-// newFullStack starts a HealthChecker goroutine that has no Stop() (none
-// exists on HealthChecker today), so it outlives the test. It only ever
-// touches atomics on fakeUpstreams whose listeners get closed by
-// t.Cleanup, which just means later probes fail with connection-refused —
-// harmless for test purposes.
+// newFullStack wires everything together with proper cleanup: both the
+// HealthChecker's probe loop and the StickySession's sweeper are stopped
+// via t.Cleanup so they don't outlive the test.
 func newFullStack(t *testing.T, n int, healthInterval time.Duration) *fullStack {
 	t.Helper()
 
 	pool, fakes := newFakePool(t, n)
 	sticky := NewStickySession(pool)
+	t.Cleanup(sticky.Stop)
 
 	checker := NewHealthChecker(pool, healthInterval)
 	checker.client = &http.Client{Timeout: 500 * time.Millisecond, Transport: noKeepAliveTransport()}
 	checker.Start()
+	t.Cleanup(checker.Stop)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

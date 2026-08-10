@@ -44,4 +44,28 @@
 
 ---
 
+---
+
+## Phase 3 — Production hardening
+
+**Why.** A review against real production deployment turned up several gaps: an unauthenticated memory-exhaustion path, a flapping bug in the health/failover interaction, missing HTTP server timeouts, connection-pool starvation, spoofable forwarding headers, and no operational visibility at all. None of these show up in a demo — they show up under real traffic, real attackers, or a real deploy.
+
+**What changed.**
+
+- **`internal/lb/health.go`** — fixed a flap-loop: `handleProxyError` (passive path) flips `alive` directly, but `HealthChecker.record` tracked its own success/failure streak independently, so an upstream ejected passively while its active streak was still deeply positive would be re-admitted after a *single* lucky probe, bypassing the 2-consecutive-success rule entirely. `record` now detects a streak that couldn't have produced the upstream's current `alive` state on its own (i.e. was changed out-of-band) and resets it, so re-admission always requires a full healthy streak regardless of who flipped the flag.
+- **`internal/lb/pool.go`** — the passive path no longer ejects an upstream on a single failed request; it now takes `passiveFailThreshold` (2, matching the active checker) consecutive failures — transport errors *and* 5xx responses, via a new `ModifyResponse` hook, since `ReverseProxy` never calls `ErrorHandler` for an HTTP error status. A per-request "tried" set (context-carried) replaces reliance on the `alive` flag for failover exclusion, so a retry chain can never revisit an upstream it already failed against even before that upstream crosses the ejection threshold.
+- **`internal/lb/sticky.go`** — capped the session table at `maxSessions` (100k); past the cap, cookie-less traffic (the common shape for API clients, probes, or an attacker looping requests) is still routed but not pinned, instead of growing the map without bound. Cookie now sets `Secure`, `SameSite=Lax`, and `Max-Age`. `sweep()` collects expired keys under a read lock and only takes the write lock for the (much smaller) delete pass, so a sweep over a large map no longer blocks every concurrent `Route()` call for its full duration. Added `Stop()` for a clean shutdown of the sweeper goroutine.
+- **`internal/lb/health.go`** — added `Stop()` so the probe loop can be halted instead of leaking for the life of the process.
+- **`internal/lb/upstream.go`** — each upstream now gets its own tuned `*http.Transport` (previously nil, silently falling back to `http.DefaultTransport`'s `MaxIdleConnsPerHost` of 2, which meant connections were torn down and re-dialed on nearly every request under real concurrency). Switched from the legacy `Director` to the `Rewrite` hook with `SetXForwarded()`, and explicitly strip any inbound `X-Forwarded-For` first — this LB is the trust boundary, so a client-supplied value must not be relayed as if it were part of a trusted proxy chain. `NewUpstream` now rejects a URL with no scheme or host instead of silently accepting it (`url.Parse` alone is too permissive — a typo'd config like `"localhost:9001"` parses without error).
+- **`cmd/server/main.go`** — rewritten: upstream list and listen address now come from `LB_UPSTREAMS`/`LB_ADDR` (previously hardcoded, requiring a rebuild to change); `/health` reflects real pool state instead of a static "ok"; the `http.Server` sets read/write/idle timeouts (previously none, making the LB trivially slow-loris-able); SIGINT/SIGTERM trigger `Server.Shutdown` with a drain timeout instead of the process dying mid-response; added `/metrics` (hand-rolled Prometheus text format — the project stays dependency-free) and structured JSON access logs with a generated/propagated `X-Request-ID`.
+- **Repo hygiene** — added `.gitignore`; untracked `server.exe`, `test/bin/server.exe`, `cmd/backend/bin/backend`, and `test/lb_output.log` (all stale build artifacts already regenerated fresh by `test/lb_test.py`); added `cmd/server/Dockerfile` alongside the existing `cmd/backend/Dockerfile`.
+
+**Gotchas to remember.**
+
+- **The cookie's `Secure` flag means sticky sessions silently stop working over plain HTTP.** Fine in production behind TLS (terminated at the edge or by this process), but a browser hitting `http://localhost:8080` directly in local dev won't send the cookie back — every request looks cookie-less. `curl`/`httptest`-based testing is unaffected since nothing there enforces the attribute.
+- **`passiveFailThreshold` and `unhealthyThreshold` are intentionally the same constant** (`passiveFailThreshold = unhealthyThreshold`) so the passive and active paths agree on how much evidence "unhealthy" requires. Don't let them drift apart without a reason.
+- Hot-reload of the upstream list (SIGHUP or a config watcher) was considered and deliberately deferred — env-var config unblocks real deployment, but changing the pool still requires a restart.
+
+---
+
 *Future phases get appended here as the project grows.*
